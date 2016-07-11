@@ -1,0 +1,186 @@
+#!/bin/bash -e
+
+function usage() {
+  cat <<MSG
+USAGE
+ $0 <options>"
+
+OPTIONS
+  -f from postgresl version                   (e.g. 9.1, 9.5)
+  -t to   postgresl version
+
+  -p primary host.                            (e.g. user@sql.example.org)
+  -r comma separated list of secondary hosts  (e.g. user@sql1,user@sql2)
+
+  -C dry-run.                                 Will not do any operations on fs.
+  -S step-by-step.                            Prompt before doing next step
+
+
+MSG
+  exit 1
+}
+
+# Allowed options
+while getopts "f:t:p:r:CS" option; do
+  case $option in
+    f) FROM_VERSION=$OPTARG ;;
+    t) TO_VERSION=$OPTARG ;;
+    p) PRIMARY=$OPTARG ;;
+    r) SECONDARIES=$(echo $OPTARG | sed "s/,/ /g") ;;
+    C) DRY_RUN=true ;;
+    S) STEP=true ;;
+    ?) usage ;;
+  esac
+done
+
+if [ -z $FROM_VERSION ] && [ -z $TO_VERSION ] && [ -z $PRIMARY ]; then
+  usage
+fi
+
+
+function start_green() {
+  echo -e "\033[32m\c"
+}
+function start_blue() {
+  echo -e "\033[34m\c"
+}
+function start_red() {
+  echo -e "\033[31m\c"
+}
+function stop_color() {
+  echo -e "\033[m\c"
+}
+
+function step() {
+    if [ $STEP ]
+    then
+        read -p "Continue? [yY/nN] " -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+}
+
+start_green
+cat <<PARAMS
+OPTIONS
+
+  From: $FROM_VERSION → To: $TO_VERSION
+
+  Primary: $PRIMARY
+  Secondaries: $SECONDARIES
+
+  Dry-run: $DRY_RUN     Step: $STEP
+
+PARAMS
+stop_color
+
+function is_new_installed() {
+    is_new_installed_one $PRIMARY
+    for secondary in $SECONDARIES
+    do
+        is_new_installed_one $secondary
+    done
+    echo
+}
+function is_new_installed_one() {
+    local host=$1
+
+    start_red
+    # Displays the version of the postgresql server
+    ssh "$host" "/usr/lib/postgresql/$TO_VERSION/bin/postgres --version" | grep "$TO_VERSION" > /dev/null
+    start_green
+    echo "Postgres $TO_VERSION ok on $host"
+    stop_color
+}
+
+function are_secondaries_synced_and_up() {
+    is_old_cluster_up $PRIMARY
+    for secondary in $SECONDARIES
+    do
+        is_old_cluster_up $secondary
+        is_secondary_synced $secondary
+    done
+}
+function is_old_cluster_up() {
+    local host=$1
+
+    start_red
+    # Display information on present clusters and dump detailed infos on $FROM_VERSION/main cluster
+    ssh "$host" "pg_lsclusters &&  LC_ALL=C /usr/lib/postgresql/$FROM_VERSION/bin/pg_controldata /var/lib/postgresql/$FROM_VERSION/main" > /dev/null
+    stop_color
+}
+function is_secondary_synced() {
+    local host=$1
+
+    # Print the number of seconds of delay between primary and standby servers.
+    # Should be less than 500
+    local delay_ms=$(ssh "$host" \
+                         "cd /tmp; sudo -u postgres psql -c 'SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));' | grep ' 0\.' | cut -d'.' -f2 | cut -c1-3")
+    if [ -n "$delay_ms" ] && [ "$delay_ms" -lt "600" ]
+    then
+        start_green
+        echo "Secondary $host has $delay_ms ms of delay with primary"
+    else
+        start_red
+        echo "Secondary $host has too much delay (> 600ms) with primary!"
+        exit 1
+    fi
+    stop_color
+}
+
+function stop_apps {
+    echo "Please stop any application using your database"
+    echo
+    read -p "Done? [yY/nN] " -r
+    echo
+    while [[ ! $REPLY =~ ^[Yy]$ ]]
+    do
+        read -p "Done? [yY/nN] " -r
+    done
+
+}
+
+function stop_databases {
+    local hosts=$1
+    if [ -z $DRY_RUN ]
+    then
+        for host in $hosts
+        do
+            ssh "$host" pg_ctlcluster $FROM_VERSION main stop
+        done
+    fi
+}
+
+function are_secondaries_synced_to_last_checkpoint {
+    local last_checkpoint=$(ssh "$PRIMARY" \
+                                "LC_ALL=C /usr/lib/postgresql/$FROM_VERSION/bin/pg_controldata /var/lib/postgresql/$FROM_VERSION/main | grep 'Latest checkpoint location'")
+    for secondary in $SECONDARIES
+    do
+        local secondary_checkpoint=$(ssh "$secondary" \
+                                         "LC_ALL=C /usr/lib/postgresql/$FROM_VERSION/bin/pg_controldata /var/lib/postgresql/$FROM_VERSION/main | grep 'Latest checkpoint location'")
+        if [ "$last_checkpoint" != "$secondary_checkpoint" ]
+        then
+            start_red
+            echo "Secondary $secondary did not see latest checkpoint ($last_checkpoint) from primary"
+            exit 1
+        fi
+    done
+}
+step
+is_new_installed
+step
+are_secondaries_synced_and_up
+step
+stop_apps
+step
+stop_databases $PRIMARY
+step
+are_secondaries_synced_to_last_checkpoint
+step
+stop_databases $SECONDARIES
+step
+
+# WORK IN PROGRESS...
